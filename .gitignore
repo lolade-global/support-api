@@ -4,4 +4,3 @@
 .env.backup
 .phpunit.result.cache
 /storage/*.key
-composer.lock
