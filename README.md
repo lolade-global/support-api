@@ -1,96 +1,102 @@
-# Support API (demo)
+# Support API
 
-A compact, production-shaped **Laravel** API for a customer-support inbox: businesses receive
-messages from customers across channels (web, SMS, WhatsApp), agents reply, and everything
-updates in real time. Inbound messages arrive via provider webhooks; outbound replies are
-delivered asynchronously through a Redis queue.
+A Laravel 11 API for a multi-tenant customer-support inbox. Businesses receive inbound messages via SMS/WhatsApp webhooks, agents reply through a REST API, and subscribers get real-time updates over a private broadcast channel. Outbound delivery runs asynchronously through a Redis-backed queue.
 
-I built this as a focused demonstration piece. My substantial Laravel work lives in private
-company repositories, so rather than link to something you can't read, this is a small,
-self-contained codebase where every file is deliberate and readable in ten minutes. It leans
-toward *illustrating the patterns clearly* rather than being feature-complete.
+## Requirements
 
-## Why this exists / what it demonstrates
+- PHP 8.2+
+- Laravel 11
+- Redis (queues + Horizon)
+- Pusher (broadcasting)
+- Twilio account (SMS gateway)
 
-The domain is deliberately close to a real support-chat product, so the engineering choices map
-onto problems that actually come up there: idempotent webhook ingestion, async delivery with
-retries, real-time fan-out, multi-tenant authorization, and query patterns that hold up as tables
-grow.
-
-## Feature map
-
-| Area                                                                | Where to look                                                                                                                                                                                       |
-| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Eloquent ORM** — relationships, query scopes, JSON casting | `app/Models/Conversation.php`, `app/Models/Message.php`                                                                                                                                         |
-| **JSON-based queries** (`metadata->key`)                    | `Conversation::scopeWhereMetadata()` + `tests/Unit/ConversationScopeTest.php`                                                                                                                   |
-| **Indexing / query optimization**                             | migrations in`database/migrations/` — composite indexes chosen to match real access patterns (see comments); eager loading + `withCount` in `ConversationController::index` to avoid N+1     |
-| **Queues & background jobs** (Redis + Horizon)                | `app/Jobs/DeliverOutboundMessage.php` — retries, backoff, timeout, unique lock; dispatched onto the `outbound` queue                                                                           |
-| **Real-time / event broadcasting** (Pusher + Echo)            | `app/Events/MessageCreated.php`, channel auth in `routes/channels.php`                                                                                                                          |
-| **Service Providers & container bindings**                    | `app/Providers/AppServiceProvider.php` — binds `SmsGateway` per environment, wires middleware dependency                                                                                       |
-| **Policies & Gates**                                          | `app/Policies/ConversationPolicy.php` — workspace isolation, reply rules                                                                                                                         |
-| **Middleware**                                                | `app/Http/Middleware/VerifyTwilioSignature.php` — HMAC webhook verification                                                                                                                      |
-| **Custom Artisan commands**                                   | `app/Console/Commands/CloseStaleConversations.php` — chunked mass-update, `--dry-run`, scheduled in `routes/console.php`                                                                     |
-| **Third-party integration** (Twilio)                          | `app/Services/TwilioSmsGateway.php` behind an `SmsGateway` interface, with `FakeSmsGateway` for tests                                                                                         |
-| **Security**                                                  | signature verification (`hash_equals`, constant-time), Sanctum token auth, per-user rate limiting on replies, form-request validation, `firstOrCreate` + unique `external_id` for idempotency |
-| **Testing** (Pest, service mocking)                           | `tests/Feature/`, `tests/Unit/` — HTTP flow, authorization, validation, webhook idempotency, and a job test that swaps the gateway in the container                                            |
-
-## Design notes worth calling out
-
-- **Idempotent ingestion.** Twilio retries webhooks on timeout, so the same message can arrive
-  twice. `external_id` is unique and `recordInbound()` returns the existing row on a repeat, so a
-  retry never creates a duplicate. (Same discipline I've used for payment-gateway webhooks.)
-- **Async delivery, immediate feedback.** An agent reply is written as `queued` synchronously so
-  the UI responds instantly; the actual provider send happens on the queue with retries and a
-  `failed()` hook that flags the row so the UI can offer a retry.
-- **Broadcast after commit.** Inbound broadcasting is wrapped in `DB::afterCommit` so subscribers
-  never see a message a rolled-back transaction would have erased.
-- **Indexes match access patterns, not columns.** The inbox filters by `(workspace_id, status)`
-  and sorts by `last_message_at`; there's a composite index for exactly that so the list view
-  never falls back to a filesort as the table grows.
-- **Provider behind an interface.** Nothing in the domain knows about Twilio directly — it depends
-  on `SmsGateway`. Local/test use `FakeSmsGateway`, so the suite runs with no credentials and sends
-  nothing real.
-
-## Running it locally
-
-This repo contains application code only (no `vendor/`, no framework runtime). To run it, drop it
-into a fresh Laravel 11 skeleton — takes about a minute:
+## Getting started
 
 ```bash
-# 1. Create a fresh Laravel app
-composer create-project laravel/laravel support-api-demo
-cd support-api-demo
+# 1. Drop this repo's files into a fresh Laravel 11 skeleton
+composer create-project laravel/laravel support-api
+cd support-api
+# copy app/, database/, routes/, tests/, config/services.php, composer.json, phpunit.xml, .env.example
 
-# 2. Copy this repo's app/, database/, routes/, tests/, config/services.php,
-#    composer.json (merge the extra requires), phpunit.xml, and .env.example over it.
+# 2. Install dependencies
+composer install
 
-# 3. Add the packages this project uses
-composer require laravel/horizon laravel/sanctum pusher/pusher-php-server
-composer require --dev pestphp/pest pestphp/pest-plugin-laravel
-
-# 4. Configure env + key
+# 3. Configure environment
 cp .env.example .env
 php artisan key:generate
 
-# 5. Migrate + seed (sqlite works out of the box)
-touch database/database.sqlite
+# 4. Migrate and seed
+touch database/database.sqlite   # SQLite works for local dev
 php artisan migrate --seed
 
-# 6. Run the test suite
+# 5. Run the test suite
 php artisan test
+
+# 6. (Optional) Start the queue worker
+php artisan horizon
 ```
 
-For the full experience: point `QUEUE_CONNECTION=redis` at a Redis instance and run
-`php artisan horizon`; set the Pusher vars to see `message.created` broadcast to
-`private-conversations.{id}`.
+## API
 
-## What I'd add for production (deliberately out of scope here)
+All endpoints except the Twilio webhook require a Sanctum bearer token.
 
-Full-text search over message bodies; read receipts and typing indicators over the same broadcast
-channel; a proper multi-tenant workspace resolver on the webhook (currently keyed off the route);
-per-workspace rate limits; and OpenTelemetry tracing across the ingest → queue → deliver path.
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/conversations` | List conversations (filterable by status, workspace) |
+| `GET` | `/api/conversations/{id}` | Get a conversation with its messages |
+| `POST` | `/api/conversations/{id}/reply` | Send an agent reply (rate-limited: 60/min) |
+| `POST` | `/api/webhooks/twilio/{workspace}` | Twilio inbound webhook (signature-verified) |
 
----
+## Architecture
 
-Built by Lolade Wahab. Questions or a walkthrough of the private production work I've done with
-these patterns — happy to jump on a call.
+### Inbound flow
+`POST /webhooks/twilio/{workspace}` → `VerifyTwilioSignature` middleware validates HMAC → `WebhookController` calls `MessageService::recordInbound()` → message is persisted → `MessageCreated` event broadcasts to `private-conversations.{id}` (inside `DB::afterCommit` to avoid broadcasting rolled-back rows).
+
+Inbound ingestion is idempotent: each message carries a unique `external_id` from the provider. A repeat webhook delivery returns the existing row rather than creating a duplicate.
+
+### Outbound flow
+`POST /conversations/{id}/reply` → reply row written as `queued` (instant UI feedback) → `DeliverOutboundMessage` job dispatched onto the `outbound` queue → job calls `SmsGateway::send()` → on success the row transitions to `sent`; on `failed()` it is flagged for UI retry.
+
+### Multi-tenancy
+Every conversation, contact, and message belongs to a `Workspace`. `ConversationPolicy` enforces workspace isolation — agents can only read and reply within their own workspace.
+
+## Key components
+
+| Component | File | Notes |
+|-----------|------|-------|
+| Models | `app/Models/` | Relationships, query scopes, JSON casting |
+| SMS gateway | `app/Services/TwilioSmsGateway.php` | Implements `SmsGateway` interface |
+| Fake gateway | `app/Services/FakeSmsGateway.php` | Swapped in during tests — no credentials needed |
+| Outbound job | `app/Jobs/DeliverOutboundMessage.php` | Retries, backoff, unique lock, `failed()` hook |
+| Event | `app/Events/MessageCreated.php` | Broadcasts on `private-conversations.{id}` |
+| Middleware | `app/Http/Middleware/VerifyTwilioSignature.php` | `hash_equals` constant-time HMAC check |
+| Policy | `app/Policies/ConversationPolicy.php` | Workspace isolation + reply rules |
+| Command | `app/Console/Commands/CloseStaleConversations.php` | Chunked mass-update, `--dry-run` flag, scheduled daily |
+
+## Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `TWILIO_ACCOUNT_SID` | Twilio account SID |
+| `TWILIO_AUTH_TOKEN` | Used to verify webhook signatures |
+| `TWILIO_FROM_NUMBER` | Sender phone number |
+| `PUSHER_APP_ID` | Pusher app credentials |
+| `PUSHER_APP_KEY` | |
+| `PUSHER_APP_SECRET` | |
+| `QUEUE_CONNECTION` | Set to `redis` for async delivery (default: `sync`) |
+
+See `.env.example` for the full list.
+
+## Testing
+
+Tests use Pest. The suite covers inbound webhook idempotency, agent reply authorization and validation, outbound job delivery (with the fake gateway), and conversation query scopes.
+
+```bash
+php artisan test
+# or
+./vendor/bin/pest
+```
+
+## License
+
+MIT
